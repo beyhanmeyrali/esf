@@ -1,0 +1,133 @@
+# Temporal development stack for the factory.
+#
+# Adapted (minimally, with attribution) from the CURRENT official reference:
+#   https://github.com/temporalio/samples-server  ->  compose/docker-compose-postgres.yml
+#   inspected at commit f811a033a5e79402cab9f792cea132f50344bd17
+#
+# The obsolete archived `temporalio/docker-compose` repository is NOT used.
+#
+# Deliberate differences from upstream:
+#   1. every published port is bound to 127.0.0.1 — the Temporal server, its
+#      database and its UI are never exposed beyond the loopback interface;
+#   2. host ports are moved off the defaults (3000/5432/8080) because those are
+#      already taken on this machine by unrelated services;
+#   3. versions are pinned exactly rather than tracking a floating major;
+#   4. no Elasticsearch/OpenSearch — PostgreSQL alone is sufficient for the
+#      MVP's low workflow volume and keeps the dependency surface small.
+#
+# Bring up with:  make temporal-up
+# Tear down with: make temporal-down
+
+name: factory-temporal
+
+services:
+  postgresql:
+    image: postgres:16.10-alpine
+    container_name: factory-temporal-postgresql
+    restart: unless-stopped
+    ports:
+      # Host 5433 -> container 5432: 5432 is already used on this host.
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+    networks:
+      - temporal-network
+    volumes:
+      - temporal-postgresql-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  temporal-admin-tools:
+    image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
+    container_name: factory-temporal-admin-tools
+    restart: on-failure:6
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD}
+      - POSTGRES_SEEDS=postgresql
+      - SQL_PASSWORD=${POSTGRES_PASSWORD}
+    networks:
+      - temporal-network
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh"]
+    command: /scripts/setup-postgres.sh
+
+  temporal:
+    image: temporalio/server:${TEMPORAL_VERSION}
+    container_name: factory-temporal
+    restart: unless-stopped
+    depends_on:
+      temporal-admin-tools:
+        condition: service_completed_successfully
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD}
+      - POSTGRES_SEEDS=postgresql
+      - BIND_ON_IP=0.0.0.0
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    networks:
+      - temporal-network
+    ports:
+      - "127.0.0.1:${TEMPORAL_HOST_PORT}:7233"
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 60
+
+  temporal-create-namespace:
+    image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
+    container_name: factory-temporal-create-namespace
+    restart: on-failure:5
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - DEFAULT_NAMESPACE=${TEMPORAL_NAMESPACE}
+    networks:
+      - temporal-network
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh"]
+    command: /scripts/create-namespace.sh
+
+  temporal-ui:
+    image: temporalio/ui:${TEMPORAL_UI_VERSION}
+    container_name: factory-temporal-ui
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:${TEMPORAL_UI_PORT}
+    networks:
+      - temporal-network
+    ports:
+      - "127.0.0.1:${TEMPORAL_UI_PORT}:8080"
+
+networks:
+  temporal-network:
+    driver: bridge
+    name: factory-temporal-network
+
+volumes:
+  temporal-postgresql-data:
+    name: factory-temporal-postgresql-data

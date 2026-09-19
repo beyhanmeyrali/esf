@@ -1,0 +1,118 @@
+# Deploying the factory worker
+
+The supported deployment uses an operator-managed Temporal cluster, CubeSandbox,
+and durable local storage on a dedicated factory host. Multiple workers on
+different hosts must share the same artifact filesystem. Cube template resources
+and egress policy must be set by the operator; the provider does not enforce the
+optional CPU/memory/disk fields in the factory configuration.
+
+## Configuration and credentials
+
+Start with `factory.example.toml`. Set the actual Cube endpoint and template,
+repository allowlist, harness binary, credentials and verification commands.
+For a worker using `deploy/factory-worker.service`, use absolute paths under
+`/etc/factory` for configuration and provisioned files, and set
+`storage.data_dir = "/var/lib/factory"`. The service cannot read home directories.
+
+For remote Temporal:
+
+```toml
+[temporal]
+host_port = "temporal.example.com:7233"
+namespace = "factory"
+task_queue = "factory"
+tls = true
+server_name = "temporal.example.com"
+ca_file = "/etc/factory/temporal-ca.pem"
+cert_file = "/etc/factory/client.pem"
+key_file = "/etc/factory/client-key.pem"
+payload_keyring = "/etc/factory/payload-keys.json"
+```
+
+Omit `ca_file` to use system certificate roots. Client certificate and key are
+optional if the server uses another authentication mechanism. For API-key
+authentication set `api_key_env = "TEMPORAL_API_KEY"` and supply its value in
+`/etc/factory/worker.env`. Plaintext connections are accepted only on loopback,
+and cannot carry API-key authentication. Certificate verification is mandatory.
+
+Use the same payload keyring on **every submitting CLI and worker**. Generate the
+keyring once, outside Git, and distribute it through your secret-management
+system. Its format is:
+
+```json
+{"active":"key-2026-09","keys":{"key-2026-09":"BASE64_OF_32_RANDOM_BYTES"}}
+```
+
+Generate a real file without printing the key:
+
+```sh
+umask 077
+python3 - <<'PY'
+import base64, json, secrets
+with open("payload-keys.json", "x") as f:
+    json.dump({"active": "key-2026-09", "keys": {
+        "key-2026-09": base64.b64encode(secrets.token_bytes(32)).decode()
+    }}, f)
+PY
+```
+
+Payloads use authenticated AES-256-GCM with random nonces. Failure messages are
+encoded and encrypted too. Workflow IDs, routing metadata and server-side timing
+remain visible. Historical plaintext is still readable and is not retroactively
+encrypted. Artifact storage remains plaintext with restricted file permissions;
+use encrypted volumes/backups when required. Provider credentials staged into a
+sandbox are readable by the agent.
+
+To rotate, first add the new key to all keyrings while retaining the old active
+key. Restart clients/workers so all can decrypt both keys. Then change `active`
+and restart again. Retain old keys for at least the history and backup lifetime.
+Losing a required key makes that history unrecoverable.
+
+## Install the worker
+
+1. Build with the version in `go.mod`: `go build -trimpath -o bin/factory ./cmd/factory`.
+2. Create a dedicated `factory` system user/group. Install the binary at
+   `/usr/local/bin/factory` and configuration at `/etc/factory/factory.toml`.
+3. Make configuration and secret files readable only by root and the factory
+   group (for example owner `root:factory`, mode `0640`). Create
+   `/etc/factory/worker.env`, even when no environment credentials are needed.
+4. Run `factory doctor --config /etc/factory/factory.toml` as the service user
+   with the same environment. Resolve every reported failure.
+5. Install `deploy/factory-worker.service` into `/etc/systemd/system/`, reload
+   systemd, and enable/start `factory-worker`.
+
+The service uses restricted filesystem access, a private temporary directory,
+automatic restart after failure, and SIGTERM shutdown. The worker stops polling
+and gives activities 30 seconds to finish before stopping. Temporal resumes
+outstanding work when a worker returns. Agent execution is not automatically
+retried because an acknowledgement can be lost after the agent finishes.
+
+Drain active runs before upgrading from earlier workflow code. Validate replay
+against retained histories before attempting a rolling upgrade across versions.
+
+## Operations and recovery
+
+- Alert on failed runs, unverified cleanup, disk exhaustion, missing worker
+  pollers, and Temporal queue latency. Export the existing OTLP metrics to the
+  deployment's collector and retain service logs.
+- Sandbox ownership includes the Temporal execution ID. Creation recovers an
+  existing matching sandbox after a lost response; retries do not create another
+  VM when the first create is unresolved. Cleanup searches ownership metadata
+  even when no sandbox ID was returned. If Cube loses connectivity or delays
+  visibility, inspect `factory sandboxes` and reconcile only the affected
+  execution's resources after its workflow is terminal. Keep finite Cube TTLs.
+- Evidence-write failures prevent a successful factory verdict without retrying
+  a completed agent or verification pass. When the entire artifact store is
+  unavailable, finalization retries and then fails the workflow visibly. Restore
+  storage and use the retained Temporal history to investigate; do not blindly
+  resubmit the same task to obtain missing evidence.
+- Back up Temporal's database using its operator-supported backup method, the
+  complete artifact filesystem, configuration, and the payload keyring. Stop
+  submissions and drain runs before a coordinated backup if your storage cannot
+  take consistent snapshots. Keep encrypted key backups separately protected.
+- Test restoration into an isolated namespace/cluster and a separate artifact
+  directory, using the matching keyring. Retrieve a finished manifest and patch,
+  then resume a deliberately interrupted disposable run. Never test restoration
+  by overwriting the active deployment.
+
+See [the readiness review](production-readiness.md) for executed validation.
